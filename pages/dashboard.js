@@ -1,129 +1,148 @@
-import { useState, useEffect } from 'react'
+// pages/dashboard.js
+import { useEffect, useState, useMemo } from 'react'
+import { useRouter } from 'next/router'
 import { supabase } from '../supabase/client'
 import NewSegmentModal from '../components/NewSegmentModal'
 
 export default function Dashboard() {
+  const router = useRouter()
+  const [me, setMe] = useState(null)
+  const [profile, setProfile] = useState(null)
   const [segments, setSegments] = useState([])
-  const [expandedSegment, setExpandedSegment] = useState(null)
-  const [showModal, setShowModal] = useState(false)
+  const [showNew, setShowNew] = useState(false)
+  const [loading, setLoading] = useState(true)
 
-  const fetchSegments = async () => {
-    const { data: segs, error: segErr } = await supabase
-      .from('segments')
-      .select('*')
-      .order('created_at', { ascending: false })
-
-    if (segErr) {
-      console.error(segErr)
-      return
-    }
-
-    // Fetch steps for each segment
-    const segmentsWithSteps = await Promise.all(
-      segs.map(async (seg) => {
-        const { data: steps, error: stepsErr } = await supabase
-          .from('steps')
-          .select('id, name, due_date, status, assigned_to')
-          .eq('segment_id', seg.id)
-          .order('due_date', { ascending: true })
-
-        if (stepsErr) console.error(stepsErr)
-        return { ...seg, steps: steps || [] }
-      })
-    )
-
-    setSegments(segmentsWithSteps)
-  }
+  const canEdit = useMemo(() => ['executive','associate'].includes(profile?.role), [profile])
 
   useEffect(() => {
-    fetchSegments()
-  }, [])
+    (async () => {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) return router.push('/')
+      setMe(user)
+      const { data: prof } = await supabase.from('profiles').select('*').eq('id', user.id).single()
+      setProfile(prof || null)
+      setLoading(false)
+    })()
+  }, [router])
+
+  async function fetchSegments() {
+    const { data, error } = await supabase
+      .from('segments')
+      .select('id, title, description, status, created_at')
+      .order('created_at', { ascending: false })
+    if (!error) setSegments(data || [])
+  }
+
+  useEffect(() => { fetchSegments() }, [])
+
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center bg-[#0b132b] text-gray-200">Loading…</div>
+  }
 
   return (
-    <div className="p-6 bg-gray-100 min-h-screen">
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-3xl font-bold text-gray-800">Production Dashboard</h1>
+    <div className="min-h-screen bg-[#0b132b] text-gray-200">
+   <header className="bg-[#1c2541] text-white shadow">
+  <div className="max-w-6xl mx-auto px-6 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    {/* Left: title + role */}
+    <div>
+      <h1 className="text-2xl font-semibold">TNN Production</h1>
+      <p className="text-sm text-gray-300">
+        {me?.email} · Role: <span className="capitalize">{profile?.role}</span>
+      </p>
+    </div>
+
+    {/* Right: unified action bar */}
+    <nav className="flex flex-wrap items-center gap-2 sm:gap-3">
+      <a
+        href="/my-tasks"
+        className="inline-flex h-9 items-center justify-center px-3 rounded-md bg-[#3a506b] text-white
+                   hover:bg-[#5bc0be] hover:text-black transition-colors shadow-sm
+                   focus:outline-none focus:ring-2 focus:ring-[#5bc0be] focus:ring-offset-2 focus:ring-offset-[#1c2541]"
+      >
+        My Tasks
+      </a>
+
+      {canEdit && (
+        <a
+          href="/approvals"
+          className="inline-flex h-9 items-center justify-center px-3 rounded-md bg-[#3a506b] text-white
+                     hover:bg-[#5bc0be] hover:text-black transition-colors shadow-sm
+                     focus:outline-none focus:ring-2 focus:ring-[#5bc0be] focus:ring-offset-2 focus:ring-offset-[#1c2541]"
+        >
+          Approvals
+        </a>
+      )}
+
+      {canEdit && (
+        <a
+          href="/admin"
+          title="User management"
+          className="inline-flex h-9 items-center justify-center px-3 rounded-md bg-transparent border border-gray-500 text-gray-100
+                     hover:bg-[#0b132b] transition-colors shadow-sm
+                     focus:outline-none focus:ring-2 focus:ring-[#5bc0be] focus:ring-offset-2 focus:ring-offset-[#1c2541]"
+        >
+          Admin Console
+        </a>
+      )}
+
+      {canEdit && (
         <button
-          onClick={() => setShowModal(true)}
-          className="bg-green-600 text-white px-4 py-2 rounded shadow hover:bg-green-700"
+          onClick={() => setShowNew(true)}
+          className="inline-flex h-9 items-center justify-center px-3 rounded-md bg-[#5bc0be] text-black
+                     hover:bg-[#6fffe9] transition-colors shadow-sm
+                     focus:outline-none focus:ring-2 focus:ring-[#6fffe9] focus:ring-offset-2 focus:ring-offset-[#1c2541]"
         >
           + New Segment
         </button>
-      </div>
+      )}
 
-      {segments.length === 0 ? (
-        <p className="text-gray-500">No segments yet. Create one to get started.</p>
-      ) : (
-        segments.map((seg) => (
-          <div key={seg.id} className="bg-white rounded shadow mb-4">
-            {/* Segment header */}
-            <div
-              className="p-4 flex justify-between items-center cursor-pointer hover:bg-gray-50"
-              onClick={() =>
-                setExpandedSegment(expandedSegment === seg.id ? null : seg.id)
-              }
-            >
-              <div>
-                <h2 className="text-xl font-semibold">{seg.name}</h2>
-                <p className="text-sm text-gray-500">
-                  Start Date: {seg.start_date}
-                </p>
-              </div>
-              <span className="text-gray-400">
-                {expandedSegment === seg.id ? '▲' : '▼'}
-              </span>
-            </div>
+      <button
+        onClick={async () => { await supabase.auth.signOut(); router.push('/') }}
+        className="inline-flex h-9 items-center justify-center px-3 rounded-md bg-gray-800 text-white
+                   hover:bg-gray-700 transition-colors shadow-sm
+                   focus:outline-none focus:ring-2 focus:ring-[#5bc0be] focus:ring-offset-2 focus:ring-offset-[#1c2541]"
+      >
+        Sign out
+      </button>
+    </nav>
+  </div>
+</header>
 
-            {/* Steps list */}
-            {expandedSegment === seg.id && (
-              <div className="p-4 border-t">
-                {seg.steps.length === 0 ? (
-                  <p className="text-gray-400">No steps assigned yet.</p>
-                ) : (
-                  <ul>
-                    {seg.steps.map((step) => (
-                      <li
-                        key={step.id}
-                        className="flex justify-between items-center p-2 border-b last:border-none"
-                      >
-                        <div>
-                          <p className="font-medium">{step.name}</p>
-                          <p className="text-sm text-gray-500">
-                            Due: {step.due_date || 'Not set'}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-4">
-                          <span
-                            className={`px-2 py-1 rounded text-sm ${
-                              step.status === 'Complete'
-                                ? 'bg-green-200 text-green-800'
-                                : step.status === 'In Progress'
-                                ? 'bg-blue-200 text-blue-800'
-                                : 'bg-gray-200 text-gray-800'
-                            }`}
-                          >
-                            {step.status || 'Not Started'}
-                          </span>
-                          <span className="text-gray-500 text-sm">
-                            {step.assigned_to || 'Unassigned'}
-                          </span>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
+ 
+
+      <main className="max-w-6xl mx-auto px-6 py-6 space-y-4">
+        {segments.length === 0 ? (
+          <div className="rounded-lg bg-[#1c2541] shadow p-6 text-gray-200">
+            No segments yet. {canEdit ? 'Click “New Segment” to get started.' : 'Check back later.'}
           </div>
-        ))
-      )}
+        ) : (
+          <div className="grid sm:grid-cols-2 gap-4">
+            {segments.map(seg => (
+              <button
+                key={seg.id}
+                className="text-left rounded-lg bg-[#1c2541] shadow hover:bg-[#0b132b] transition-colors p-4"
+                onClick={() => router.push(`/segments/${seg.id}`)}
+              >
+                <div className="text-lg font-semibold text-white">{seg.title}</div>
+                <div className="text-sm text-gray-300 mt-1">
+                  {seg.description || '—'} · Created {new Date(seg.created_at).toLocaleDateString()}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </main>
 
-      {showModal && (
-        <NewSegmentModal
-          onClose={() => setShowModal(false)}
-          onCreated={fetchSegments}
-        />
-      )}
+      {showNew && (
+  <NewSegmentModal
+    onClose={() => setShowNew(false)}
+    onCreated={(newId) => {
+      setShowNew(false)
+      router.push(`/segments/${newId}`)
+    }}
+  />
+)}
+
     </div>
   )
 }
