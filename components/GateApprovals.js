@@ -2,177 +2,246 @@
 import { useEffect, useMemo, useState } from 'react'
 import { supabase } from '../supabase/client'
 
-const LABELS = {
+// Decision pill styles
+const DECISION_STYLES = {
+  approved: 'bg-green-700/70 text-green-100 border border-green-600',
+  rejected: 'bg-red-700/70 text-red-100 border border-red-600'
+}
+
+const STATUS_STYLES = {
+  not_started: 'bg-gray-700 text-gray-200',
+  in_progress: 'bg-blue-700/70 text-blue-100 border border-blue-600',
+  completed: 'bg-green-700/70 text-green-100 border border-green-600',
+  rejected: 'bg-red-700/70 text-red-100 border border-red-600',
+}
+
+// Display labels for canonical role keys
+const GATE_LABELS = {
   script_editor: 'Script Editor',
   content_strategist: 'Content Strategist',
   director: 'Director',
   post_supervisor: 'Post Supervisor',
-  producer: 'Producer',
   publisher: 'Publisher',
-  pitch_editor: 'Pitch Editor',
-  final_reviewer: 'Final Reviewer'
 }
 
-export default function GateApprovals({ step, segmentId, approverSeats, me, myProfile, onChange }) {
-  const required = step.gate_roles || []
-  const [log, setLog] = useState([])
-  const [peopleById, setPeopleById] = useState({})
-  const [comment, setComment] = useState('')
-  const [myPools, setMyPools] = useState([]) // [{pool_id, role_key}]
-  const isExecOrAssoc = myProfile?.role === 'executive' || myProfile?.role === 'associate'
+function normalizeRoleKey(raw) {
+  const k = String(raw || '').trim().toLowerCase()
+  if (k === 'pitch_editor') return 'script_editor'
+  if (k === 'final_reviewer') return 'post_supervisor'
+  return k
+}
+
+export default function StepCard({
+  step,              // { id, name, gate_roles: text[], status, due_date }
+  segmentId,
+  approverSeats,
+  me,
+  myProfile,
+  onChange
+}) {
+  const [approvals, setApprovals] = useState([])
+  const [myPoolIds, setMyPoolIds] = useState([])
+  const [saving, setSaving] = useState(false)
+  const [errorMsg, setErrorMsg] = useState('')
+
+  const gateRoles = useMemo(
+    () => Array.from(new Set((step?.gate_roles || []).map(normalizeRoleKey))).filter(Boolean),
+    [step]
+  )
 
   useEffect(() => {
-    ;(async () => {
-      const [{ data: a }, { data: ppl }] = await Promise.all([
-        supabase.from('approvals').select('id, role_key, approver_id, decision, comment, created_at').eq('step_id', step.id).order('created_at', { ascending: true }),
-        supabase.from('profiles').select('id, name, email')
-      ])
-      setLog(a || [])
-      const map = {}
-      ;(ppl || []).forEach(p => { map[p.id] = p })
-      setPeopleById(map)
-    })()
-  }, [step.id])
+    loadApprovals()
+    loadMyPools()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step?.id])
 
-  useEffect(() => {
-    ;(async () => {
-      // Find pools I’m in (so we can show "You can approve via pool")
-      const { data: pools } = await supabase
-        .from('role_pool_members')
-        .select('pool_id')
-        .eq('user_id', myProfile?.id || me?.id || '')
-      setMyPools(pools || [])
-    })()
-  }, [me, myProfile])
-
-  const statusByRole = useMemo(() => {
-    const out = {}
-    required.forEach(r => { out[r] = null })
-    for (const a of log) {
-      if (!required.includes(a.role_key)) continue
-      out[a.role_key] = a.decision === 'approved' ? a : { ...a, rejected: true }
-    }
-    return out
-  }, [log, required])
-
-  const approvedCount = Object.values(statusByRole).filter(v => v && !v.rejected).length
-  const anyRejected   = Object.values(statusByRole).some(v => v?.rejected)
-
-  const canApprove = useMemo(() => {
-    if (!myProfile) return false
-    if (isExecOrAssoc) return true
-    // explicit seat
-    const isExplicit = required.some(r => approverSeats?.[r]?.user_id === myProfile.id)
-    if (isExplicit) return true
-    // via pool (only if that seat uses a pool and I’m in it)
-    const myPoolIds = new Set(myPools.map(x => x.pool_id))
-    return required.some(r => {
-      const poolId = approverSeats?.[r]?.pool_id
-      return poolId && myPoolIds.has(poolId)
-    })
-  }, [myProfile, approverSeats, required, myPools, isExecOrAssoc])
-
-  async function act(decision) {
-    if (!canApprove) return
-
-    // Prefer explicit seat for me; else the first role where I’m eligible
-    const myPoolIds = new Set(myPools.map(x => x.pool_id))
-    let useRole = required.find(r => approverSeats?.[r]?.user_id === myProfile.id)
-    if (!useRole) {
-      useRole = required.find(r => {
-        const poolId = approverSeats?.[r]?.pool_id
-        return poolId && myPoolIds.has(poolId)
-      })
-    }
-    if (!useRole) useRole = required[0] // fallback for exec override
-
-    const payload = {
-      step_id: step.id,
-      role_key: useRole,
-      approver_id: myProfile.id,
-      decision,
-      comment: comment || null
-    }
-    const { error } = await supabase.from('approvals').insert(payload)
-    if (error) { alert(error.message || 'Failed to record decision'); return }
-    setComment('')
-    const { data: a } = await supabase
+  async function loadApprovals() {
+    if (!step?.id) return
+    const { data, error } = await supabase
       .from('approvals')
-      .select('id, role_key, approver_id, decision, comment, created_at')
-      .eq('step_id', step.id).order('created_at', { ascending: true })
-    setLog(a || [])
-    onChange?.()
+      .select('id, role_key, approver_id, decision, created_at, profiles:approver_id(name, email)')
+      .eq('step_id', step.id)
+      .order('created_at', { ascending: false })
+    if (!error) setApprovals(data || [])
   }
 
-  function SeatRow({ roleKey }) {
-    const seat = approverSeats?.[roleKey] || {}
-    const res  = statusByRole[roleKey]
-    const name = seat.user_id
-      ? (peopleById[seat.user_id]?.name || peopleById[seat.user_id]?.email || (seat.user_id || '').slice(0,8))
-      : (seat.pool_id ? `Pool: ${seat.pool_id}` : 'Unassigned')
-
-    const poolHint = seat.pool_id
-      ? <span className="ml-2 text-xs text-[#6fffe9]">({myPools.some(p=>p.pool_id===seat.pool_id) ? 'You’re eligible via pool' : 'Pool assigned'})</span>
-      : null
-
-    const chip = res
-      ? res.rejected
-        ? <span className="text-xs px-2 py-0.5 rounded bg-red-700 text-red-100">Needs changes</span>
-        : <span className="text-xs px-2 py-0.5 rounded bg-green-700 text-green-100">Approved</span>
-      : <span className="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-200">Pending</span>
-
-    const overrideNote = res && res.approver_id && seat.user_id && seat.user_id !== res.approver_id
-      ? ` · Approved by ${peopleById[res.approver_id]?.name || (res.approver_id || '').slice(0,8)} (not assigned)`
-      : ''
-
-    return (
-      <div className="flex items-center justify-between">
-        <div className="text-sm">
-          <span className="text-gray-300">{LABELS[roleKey] || roleKey}:</span>{' '}
-          <span className="text-white font-medium">{name}</span>
-          {poolHint}
-          <span className="text-gray-400">{overrideNote}</span>
-        </div>
-        {chip}
-      </div>
-    )
+  async function loadMyPools() {
+    if (!me?.id) return
+    const { data, error } = await supabase
+      .from('role_pool_members')
+      .select('pool_id')
+      .eq('user_id', me.id)
+    if (!error) setMyPoolIds((data || []).map(r => r.pool_id))
   }
+
+  function isLikelyEligible(roleKey) {
+    const seat = approverSeats?.[roleKey]
+    if (!seat) return false
+    if (seat.user_id && me?.id && seat.user_id === me.id) return true
+    if (seat.pool_id && myPoolIds.includes(seat.pool_id)) return true
+    return false
+  }
+
+  function lastDecisionByRole(roleKey) {
+    return approvals.find(a => a.role_key === roleKey) || null
+  }
+
+  // Determine status automatically based on approvals
+  const computedStatus = useMemo(() => {
+    if (gateRoles.length === 0) return 'not_started'
+    if (approvals.length === 0) return 'not_started'
+    // Check if any rejection
+    if (approvals.some(a => a.decision === 'rejected')) return 'rejected'
+    // Check if all approved
+    const approvedSet = new Set(approvals.filter(a => a.decision === 'approved').map(a => a.role_key))
+    const allApproved = gateRoles.every(rk => approvedSet.has(rk))
+    if (allApproved) return 'completed'
+    return 'in_progress'
+  }, [approvals, gateRoles])
+
+  async function takeDecision(roleKeyRaw, decision) {
+    const roleKey = normalizeRoleKey(roleKeyRaw)
+    setErrorMsg('')
+    setSaving(true)
+
+    const stepIdNum = Number(step.id)
+    if (!Number.isFinite(stepIdNum)) {
+      setSaving(false)
+      setErrorMsg(`This step id ("${step.id}") is not a number. Check steps.id type.`)
+      return
+    }
+    if (!me?.id) {
+      setSaving(false)
+      setErrorMsg('Not authenticated.')
+      return
+    }
+
+    const rowBase = { step_id: stepIdNum, role_key: roleKey, approver_id: me.id }
+    const nowIso = new Date().toISOString()
+
+    let { error } = await supabase
+      .from('approvals')
+      .upsert({ ...rowBase, decision, created_at: nowIso }, { onConflict: 'step_id,role_key,approver_id' })
+      .select()
+
+    if (error) {
+      console.warn('approvals upsert failed; fallback', error)
+      const { data: existing } = await supabase
+        .from('approvals')
+        .select('id')
+        .match(rowBase)
+        .maybeSingle()
+
+      if (!existing) {
+        await supabase.from('approvals').insert({ ...rowBase, decision, created_at: nowIso })
+      } else {
+        await supabase.from('approvals').update({ decision, created_at: nowIso }).match(rowBase)
+      }
+    }
+
+    setSaving(false)
+    await loadApprovals()
+    await onChange?.()
+  }
+
+  const status = computedStatus
+  const statusLabel = status.replace('_', ' ')
+  const dueDate = step?.due_date ? new Date(step.due_date) : null
+  const isOverdue = dueDate && dueDate < new Date() && status !== 'completed'
+
+  // Calculate approval progress for progress bar
+  const totalRoles = gateRoles.length
+  const approvedCount = approvals.filter(a => a.decision === 'approved').map(a => a.role_key)
+    .filter((v, i, a) => a.indexOf(v) === i).length
+  const progressPercent = totalRoles > 0 ? Math.round((approvedCount / totalRoles) * 100) : 0
 
   return (
-    <div className="rounded-lg bg-[#0f1a33] border border-gray-700 p-4 space-y-3">
-      <div className="text-sm text-gray-300">
-        Gate requires <span className="font-semibold text-white">{required.length}</span> approval(s) ·{' '}
-        <span className="font-semibold text-white">{approvedCount}</span>/<span className="font-semibold text-white">{required.length}</span> complete
-        {anyRejected && <span className="ml-2 text-red-400">(revisions required)</span>}
+    <div className="rounded-lg bg-[#0f1a33] border border-gray-700 p-4">
+      {/* Header with name, status, due date */}
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="font-semibold text-white">{step?.name || `Step ${step?.id}`}</h3>
+        <div className="flex items-center gap-3">
+          {dueDate && (
+            <span className={`text-xs ${isOverdue ? 'text-red-400 font-semibold' : 'text-gray-300'}`}>
+              Due {dueDate.toLocaleDateString()}
+            </span>
+          )}
+          <span className={`text-xs px-2 py-0.5 rounded ${STATUS_STYLES[status] || STATUS_STYLES.not_started}`}>
+            {statusLabel}
+          </span>
+          {saving && <div className="text-xs text-gray-300">Saving…</div>}
+        </div>
       </div>
 
-      <div className="space-y-2">
-        {required.map(r => <SeatRow key={r} roleKey={r} />)}
-      </div>
+      {/* Progress bar */}
+      {totalRoles > 0 && (
+        <div className="w-full bg-gray-700 rounded h-2 mb-4 overflow-hidden">
+          <div
+            className={`h-2 rounded bg-green-600 transition-all duration-300`}
+            style={{ width: `${progressPercent}%` }}
+          />
+        </div>
+      )}
 
-      <div className="flex items-center gap-2">
-        <input
-          className="flex-1 text-sm rounded border border-gray-600 bg-[#0b132b] text-gray-200 px-2 py-1"
-          placeholder="Optional note"
-          value={comment}
-          onChange={(e)=>setComment(e.target.value)}
-          disabled={!canApprove}
-        />
-        <button
-          className={`px-3 py-1 text-sm rounded ${canApprove ? 'bg-green-700 hover:bg-green-600 text-white' : 'bg-gray-700 text-gray-400 cursor-not-allowed'}`}
-          onClick={() => canApprove && act('approved')}
-          disabled={!canApprove}
-        >
-          Approve
-        </button>
-        <button
-          className={`px-3 py-1 text-sm rounded ${canApprove ? 'bg-red-700 hover:bg-red-600 text-white' : 'bg-gray-700 text-gray-400 cursor-not-allowed'}`}
-          onClick={() => canApprove && act('rejected')}
-          disabled={!canApprove}
-        >
-          Needs changes
-        </button>
-      </div>
+      {gateRoles.length === 0 ? (
+        <div className="text-sm text-gray-300">No gates required for this step.</div>
+      ) : (
+        <ul className="space-y-3">
+          {gateRoles.map((rk) => {
+            const label = GATE_LABELS[rk] || rk
+            const seat = approverSeats?.[rk] || {}
+            const decision = lastDecisionByRole(rk)
+            const eligible = isLikelyEligible(rk)
+
+            return (
+              <li key={rk} className="rounded-md bg-[#0b132b] border border-gray-700 p-3">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-white font-medium">{label}</div>
+                    <div className="text-xs text-gray-400">
+                      Seat: {seat.user_id ? 'Assigned to a person' : seat.pool_id ? 'Assigned to a pool' : 'Unassigned'}
+                    </div>
+
+                    {decision ? (
+                      <div className="mt-1 inline-flex items-center gap-2">
+                        <span className={`text-xs px-2 py-0.5 rounded ${DECISION_STYLES[decision.decision] || 'bg-gray-700 text-gray-200'}`}>
+                          {decision.decision}
+                        </span>
+                        <span className="text-xs text-gray-400">
+                          by {decision.profiles?.name || decision.profiles?.email || decision.approver_id?.slice(0,8)}
+                          {' · '}
+                          {new Date(decision.created_at).toLocaleString()}
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="mt-1 text-xs text-gray-400">No decision yet</div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    {eligible && (
+                      <>
+                        <button
+                          onClick={() => takeDecision(rk, 'approved')}
+                          className="px-3 py-1.5 rounded text-sm bg-green-600 hover:bg-green-500 text-white transition"
+                        >
+                          Approve
+                        </button>
+                        <button
+                          onClick={() => takeDecision(rk, 'rejected')}
+                          className="px-3 py-1.5 rounded text-sm bg-red-600 hover:bg-red-500 text-white transition"
+                        >
+                          Reject
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
     </div>
   )
 }
