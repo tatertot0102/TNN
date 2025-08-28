@@ -1,15 +1,58 @@
 // components/NewSegmentModal.js
 import { useEffect, useMemo, useState } from 'react'
+import TimelinePlanner from './TimelinePlanner'
 import { supabase } from '../supabase/client'
 
 const SEATS = [
   { key: 'script_editor',      label: 'Script Editor (Gate)' },
   { key: 'content_strategist', label: 'Content Strategist (Gate)' },
-  { key: 'director',           label: 'Director (Prod Gate)' },
+  { key: 'director',           label: 'Director (Gate)' },
   { key: 'post_supervisor',    label: 'Post Supervisor (Gate)' },
   { key: 'producer',           label: 'Producer (Optional)' },
   { key: 'publisher',          label: 'Publisher (Optional)' }, // shown only if publish is enabled
 ]
+
+/**
+ * Canonical step template (names align with pages/segments/[id].js)
+ * key: persisted phase key
+ * name: UI label
+ * timing:
+ *   - pre-production steps are scheduled BEFORE produceDate
+ *   - production & post are scheduled ON/AFTER produceDate
+ */
+const STEP_TEMPLATE = [
+  // Pre-production
+  { key: 'idea_drafting',     name: 'Idea Drafting',               is_gate: false, minDuration: 2 },
+  { key: 'script_approval',   name: 'Script Approval',             is_gate: true,  gate_roles: ['script_editor'],   minDuration: 2 },
+  { key: 'content_strategy',  name: 'Content Strategy Review',     is_gate: true,  gate_roles: ['content_strategist'], minDuration: 1 },
+
+  // Production day
+  { key: 'production_recording', name: 'Production: Recording',    is_gate: false, atOffset: 0 },
+
+  // Same-day/next-day production wrap-up gate
+  { key: 'production_complete',  name: 'Production Complete',      is_gate: true,  gate_roles: ['director'],  afterOffset: 1 },
+
+  // Post-production
+  { key: 'post_editing',      name: 'Post-Production Editing',     is_gate: false, afterOffset: 2 },
+  { key: 'post_final',        name: 'Post Final Approval',         is_gate: true,  gate_roles: ['post_supervisor'], afterOffset: 3 },
+
+  // Optional
+  { key: 'publish',           name: 'Publish',                     is_gate: true,  gate_roles: ['publisher'], afterOffset: 4, optional: true },
+]
+
+function addDays(d, n) {
+  const x = new Date(d)
+  x.setDate(x.getDate() + n)
+  return x
+}
+function ymd(d) {
+  return new Date(d).toISOString().slice(0,10)
+}
+function diffDays(a, b) {
+  const d1 = new Date(a); d1.setHours(0,0,0,0)
+  const d2 = new Date(b); d2.setHours(0,0,0,0)
+  return Math.round((d1 - d2) / (1000 * 60 * 60 * 24))
+}
 
 export default function NewSegmentModal({ onClose, onCreated }) {
   const [profile, setProfile] = useState(null)
@@ -20,6 +63,9 @@ export default function NewSegmentModal({ onClose, onCreated }) {
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [owner, setOwner] = useState('')
+
+  const [produceDate, setProduceDate] = useState('')
+  const [stepDates, setStepDates] = useState({})
 
   // options
   const [needsDesign, setNeedsDesign] = useState(false)
@@ -35,8 +81,12 @@ export default function NewSegmentModal({ onClose, onCreated }) {
   const [saving, setSaving] = useState(false)
   const isExec = useMemo(() => ['executive','associate'].includes(profile?.role), [profile])
 
+  // Drag and drop state for step pipeline
+  const [draggingStep, setDraggingStep] = useState(null)
+  const [warnings, setWarnings] = useState([])
+
   useEffect(() => {
-    (async () => {
+    ;(async () => {
       const { data: { user } } = await supabase.auth.getUser()
       if (!user) return
       const { data: me } = await supabase.from('profiles').select('*').eq('id', user.id).single()
@@ -49,6 +99,63 @@ export default function NewSegmentModal({ onClose, onCreated }) {
       setPools(pls || [])
     })()
   }, [])
+
+  /**
+   * Compute default dates from the produce date.
+   * Rules:
+   *  - Production Recording = D0
+   *  - Production Complete (Director) = D0 + 1
+   *  - Post Editing = D0 + 2
+   *  - Post Final (Post Supervisor) = D0 + 3
+   *  - Publish (optional) = D0 + 4
+   *  - Pre-production:
+   *      Content Strategy Review = D0 - 1
+   *      Script Approval (gate) = D0 - 3 (min 2 days window before CSR)
+   *      Idea Drafting = D0 - 5 (min 2 days window before Script Approval)
+   *  - If there’s extra lead time before D0 (more than the minimum 7 days),
+   *    distribute the extra equally to Idea Drafting and Script Approval by pushing
+   *    their due dates earlier.
+   */
+  useEffect(() => {
+    if (!produceDate) return
+    const D0 = new Date(produceDate)
+    const today = new Date(); today.setHours(0,0,0,0)
+
+    // Minimum layout requires 7 days before D0 for pre-prod blocks (2 + 2 + 1 + buffer for ordering).
+    const MIN_PRE_WINDOW = 7
+    const totalLead = Math.max(0, diffDays(D0, today)) // days from today to D0
+    const extra = Math.max(0, totalLead - MIN_PRE_WINDOW)
+    const giveIdea = Math.ceil(extra / 2)
+    const giveScript = Math.floor(extra / 2)
+
+    const dates = {}
+
+    // Pre-production (earlier is smaller ymd)
+    dates['content_strategy']  = ymd(addDays(D0, -1))
+    dates['script_approval']   = ymd(addDays(D0, -3 - giveScript))
+    dates['idea_drafting']     = ymd(addDays(D0, -5 - giveIdea))
+
+    // Production day
+    dates['production_recording'] = ymd(addDays(D0, 0))
+
+    // Wrap-up & post
+    dates['production_complete']  = ymd(addDays(D0, 1))
+    dates['post_editing']         = ymd(addDays(D0, 2))
+    dates['post_final']           = ymd(addDays(D0, 3))
+    dates['publish']              = ymd(addDays(D0, 4))
+
+    setStepDates(dates)
+    // Deadline warnings after setting stepDates
+    const todayStr = ymd(today)
+    const bad = []
+    Object.entries(dates).forEach(([k,v]) => {
+      if (v < todayStr) {
+        const label = STEP_TEMPLATE.find(st => st.key===k)?.name || k
+        bad.push(`${label} is before today`)
+      }
+    })
+    setWarnings(bad)
+  }, [produceDate])
 
   if (!isExec) {
     return (
@@ -70,20 +177,19 @@ export default function NewSegmentModal({ onClose, onCreated }) {
   }
 
   const displayName = (p) => p?.name || p?.email || (p?.id || '').slice(0,8)
-  const rolePools = (roleKey) => pools.filter(pl => pl.role_key === roleKey)
-
-  function setSeat(roleKey, next) {
-    setSeatState(prev => ({ ...prev, [roleKey]: { userId: next.userId || '', poolId: next.poolId || '' } }))
-  }
+  const rolePools   = (roleKey) => pools.filter(pl => pl.role_key === roleKey)
+  const setSeat     = (roleKey, next) => setSeatState(prev => ({ ...prev, [roleKey]: { userId: next.userId || '', poolId: next.poolId || '' } }))
 
   async function submit(e) {
     e.preventDefault()
+
     const se = seatState['script_editor'] || {}
     const cs = seatState['content_strategist'] || {}
     const dr = seatState['director'] || {}
     const ps = seatState['post_supervisor'] || {}
 
     if (!title.trim() || !owner) return alert('Title and Owner are required.')
+    if (!produceDate) return alert('Please set a Produce Date.')
     if (!se.userId && !se.poolId) return alert('Assign a Script Editor (person or pool).')
     if (!cs.userId && !cs.poolId) return alert('Assign a Content Strategist (person or pool).')
     if (!dr.userId && !dr.poolId) return alert('Assign a Director (person or pool).')
@@ -118,6 +224,22 @@ export default function NewSegmentModal({ onClose, onCreated }) {
     setSaving(false)
 
     if (error) return alert(error.message || 'Failed to create segment')
+    if (!data) return
+
+    // Build steps with aligned names/keys
+    const toInclude = STEP_TEMPLATE.filter(st => !st.optional || needsPublish)
+    const rows = toInclude.map(st => ({
+      segment_id: data.id,
+      name: st.name,
+      phase: st.key,
+      due_date: stepDates[st.key] || null,
+      is_gate: !!st.is_gate,
+      gate_roles: st.gate_roles || []
+    }))
+
+    const { error: stepErr } = await supabase.from('steps').insert(rows)
+    if (stepErr) return alert(stepErr.message || 'Segment created, but adding steps failed.')
+
     onClose?.()
     onCreated?.(data)
   }
@@ -129,9 +251,9 @@ export default function NewSegmentModal({ onClose, onCreated }) {
       {/* Scrollable overlay */}
       <div className="fixed inset-0 z-50 overflow-y-auto">
         <div className="min-h-full flex items-center justify-center p-4">
-          {/* Panel: flex column with sticky header/footer and scrollable body */}
+          {/* Panel */}
           <div className="w-full sm:max-w-3xl bg-[#1c2541] text-gray-100 rounded-lg shadow-xl border border-gray-700 max-h-[90vh] flex flex-col">
-            {/* Header (sticky) */}
+            {/* Header */}
             <div className="px-5 py-4 border-b border-gray-700 sticky top-0 bg-[#1c2541] z-10">
               <div className="flex items-center justify-between">
                 <h2 className="text-lg font-semibold">New Segment</h2>
@@ -139,7 +261,7 @@ export default function NewSegmentModal({ onClose, onCreated }) {
               </div>
             </div>
 
-            {/* Body (scrollable) */}
+            {/* Body */}
             <form onSubmit={submit} className="flex-1 overflow-y-auto px-5 py-4 space-y-5">
               {/* Basics */}
               <div className="grid sm:grid-cols-2 gap-3">
@@ -170,6 +292,17 @@ export default function NewSegmentModal({ onClose, onCreated }) {
                 </select>
               </div>
 
+              {/* Produce Date */}
+              <div>
+                <div className="text-sm text-gray-300 mb-1">Produce Date (final deadline)</div>
+                <input
+                  type="date"
+                  className="w-full rounded border border-gray-600 bg-[#0b132b] text-gray-100 px-3 py-2"
+                  value={produceDate}
+                  onChange={e => setProduceDate(e.target.value)}
+                />
+              </div>
+
               {/* Decision Seats */}
               <div className="rounded-lg bg-[#142041] border border-gray-700 p-4 space-y-3">
                 <div className="flex items-center justify-between">
@@ -190,6 +323,30 @@ export default function NewSegmentModal({ onClose, onCreated }) {
                   ))}
                 </div>
               </div>
+
+              {/* Step Pipeline Preview */}
+              {produceDate && (
+                <div className="rounded-lg bg-[#142041] border border-gray-700 p-4 space-y-3">
+                  <h3 className="font-semibold text-white">Step Pipeline</h3>
+                  <TimelinePlanner
+                    produceDate={produceDate}
+                    initialPre={STEP_TEMPLATE.filter(st => !st.optional && st.key !== 'publish' && st.key !== 'production_recording' && st.key !== 'production_complete' && st.key !== 'post_editing' && st.key !== 'post_final')}
+                    postSpec={STEP_TEMPLATE.filter(st => ['production_recording','production_complete','post_editing','post_final','publish'].includes(st.key) && (!st.optional || needsPublish))}
+                    onSchedule={({ datesMap, warnings }) => {
+                      setStepDates(datesMap)
+                      setWarnings(warnings)
+                    }}
+                  />
+                  {warnings.length > 0 && (
+                    <div className="text-xs text-red-400 mt-2 space-y-1">
+                      {warnings.map((w,i) => <div key={i}>⚠ {w}</div>)}
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-300 mt-2">
+                    Deadlines before today will be flagged.
+                  </p>
+                </div>
+              )}
 
               {/* Production / Post optional assignees */}
               <div className="grid sm:grid-cols-2 gap-3">
@@ -219,7 +376,7 @@ export default function NewSegmentModal({ onClose, onCreated }) {
                 </label>
               </div>
 
-              {/* Footer (sticky) */}
+              {/* Footer */}
               <div className="sticky bottom-0 bg-[#1c2541] -mx-5 px-5 pt-3 border-t border-gray-700 flex items-center justify-end gap-2">
                 <button type="button" onClick={onClose} className="px-3 py-2 rounded bg-gray-700 hover:bg-gray-600">
                   Cancel

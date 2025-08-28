@@ -3,52 +3,58 @@ import { useState } from 'react'
 import { supabase } from '../supabase/client'
 
 export default function UploadAsset({ segmentId, stepId, onUploaded }) {
-  const [file, setFile] = useState(null)
+  const [link, setLink] = useState('')
   const [saving, setSaving] = useState(false)
-  const [errorMsg, setErrorMsg] = useState('')
+  const [error, setError] = useState('')
 
-  async function handleUpload(e) {
+  async function handleSubmit(e) {
     e.preventDefault()
-    setErrorMsg('')
-    if (!file) return
+    setError('')
+    if (!link.trim()) return
 
-    try {
-      setSaving(true)
-      // store in 'assets' bucket
-      const path = `${segmentId}/${stepId}/${Date.now()}_${file.name}`
-      const { data: up, error: upErr } = await supabase.storage.from('assets').upload(path, file)
-      if (upErr) throw upErr
-
-      const { data: { publicUrl } } = supabase.storage.from('assets').getPublicUrl(up.path)
-
-      // Save to DB (no description field at all)
-      const { error: dbErr } = await supabase.from('assets').insert({
-        segment_id: segmentId,
-        step_id: stepId,
-        file_url: publicUrl,
-        description: null
-      })
-      if (dbErr) throw dbErr
-
-      setFile(null)
-      onUploaded?.()
-    } catch (err) {
-      setErrorMsg(err.message || 'Upload failed')
-    } finally {
-      setSaving(false)
+    let url = link.trim()
+    if (!/^https?:\/\//i.test(url)) {
+      url = 'https://' + url
     }
+
+    // use hostname as label if no better description
+    const label = url.replace(/^https?:\/\//, '').split(/[/?#]/)[0]
+
+    setSaving(true)
+    const { error: insertError } = await supabase.from('assets').insert({
+      segment_id: segmentId,
+      step_id: stepId,
+      file_url: url,
+      name: label
+    })
+    setSaving(false)
+
+    if (insertError) {
+      setError(insertError.message)
+      return
+    }
+
+    setLink('')
+    onUploaded?.()
   }
 
   return (
-    <form onSubmit={handleUpload} className="flex items-center gap-2">
-      <input type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} className="text-sm" />
+    <form onSubmit={handleSubmit} className="flex items-center gap-2">
+      <input
+        type="text"
+        placeholder="Paste link (Google Doc, Drive, YouTube...)"
+        value={link}
+        onChange={(e) => setLink(e.target.value)}
+        className="flex-1 rounded border border-gray-600 bg-[#0b132b] text-gray-100 px-3 py-2 text-sm"
+      />
       <button
-        className="px-3 py-1.5 rounded bg-[#3a506b] hover:bg-[#5bc0be] text-white text-sm disabled:opacity-50"
-        disabled={!file || saving}
+        type="submit"
+        disabled={saving}
+        className="px-3 py-2 text-sm rounded bg-[#5bc0be] text-black hover:bg-[#6fffe9] disabled:opacity-50"
       >
-        {saving ? 'Uploading…' : 'Upload'}
+        {saving ? 'Saving…' : 'Add Link'}
       </button>
-      {errorMsg && <span className="text-xs text-red-300">{errorMsg}</span>}
+      {error && <span className="text-xs text-red-400">{error}</span>}
     </form>
   )
 }
