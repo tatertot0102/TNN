@@ -14,7 +14,8 @@ const SEATS = [
 
 /**
  * Canonical step template (names align with pages/segments/[id].js)
- * key: persisted phase key
+ * key: detailed step key (UI/timeline only)
+ * phase: coarse DB phase (pre | prod | post)
  * name: UI label
  * timing:
  *   - pre-production steps are scheduled BEFORE produceDate
@@ -22,23 +23,25 @@ const SEATS = [
  */
 const STEP_TEMPLATE = [
   // Pre-production
-  { key: 'idea_drafting',     name: 'Idea Drafting',               is_gate: false, minDuration: 2 },
-  { key: 'script_approval',   name: 'Script Approval',             is_gate: true,  gate_roles: ['script_editor'],   minDuration: 2 },
-  { key: 'content_strategy',  name: 'Content Strategy Review',     is_gate: true,  gate_roles: ['content_strategist'], minDuration: 1 },
+  { key: 'idea_drafting',        name: 'Idea Drafting',               phase: 'pre',  is_gate: false, minDuration: 2 },
+  { key: 'script_approval',      name: 'Script Approval',             phase: 'pre',  is_gate: true,  gate_roles: ['script_editor'],       minDuration: 2 },
+  { key: 'content_strategy',     name: 'Content Strategy Review',     phase: 'pre',  is_gate: true,  gate_roles: ['content_strategist'], minDuration: 1 },
 
   // Production day
-  { key: 'production_recording', name: 'Production: Recording',    is_gate: false, atOffset: 0 },
+  { key: 'production_recording', name: 'Production: Recording',       phase: 'prod', is_gate: false, atOffset: 0 },
 
   // Same-day/next-day production wrap-up gate
-  { key: 'production_complete',  name: 'Production Complete',      is_gate: true,  gate_roles: ['director'],  afterOffset: 1 },
+  { key: 'production_complete',  name: 'Production Complete',         phase: 'prod', is_gate: true,  gate_roles: ['director'],           afterOffset: 1 },
 
   // Post-production
-  { key: 'post_editing',      name: 'Post-Production Editing',     is_gate: false, afterOffset: 2 },
-  { key: 'post_final',        name: 'Post Final Approval',         is_gate: true,  gate_roles: ['post_supervisor'], afterOffset: 3 },
+  { key: 'post_editing',         name: 'Post-Production Editing',     phase: 'post', is_gate: false, afterOffset: 2 },
+  { key: 'post_final',           name: 'Post Final Approval',         phase: 'post', is_gate: true,  gate_roles: ['post_supervisor'],    afterOffset: 3 },
 
   // Optional
-  { key: 'publish',           name: 'Publish',                     is_gate: true,  gate_roles: ['publisher'], afterOffset: 4, optional: true },
+  { key: 'publish',              name: 'Publish',                     phase: 'post', is_gate: true,  gate_roles: ['publisher'],          afterOffset: 4, optional: true },
 ]
+
+const TEMPLATE_BY_KEY = Object.fromEntries(STEP_TEMPLATE.map(st => [st.key, st]))
 
 function addDays(d, n) {
   const x = new Date(d)
@@ -52,6 +55,38 @@ function diffDays(a, b) {
   const d1 = new Date(a); d1.setHours(0,0,0,0)
   const d2 = new Date(b); d2.setHours(0,0,0,0)
   return Math.round((d1 - d2) / (1000 * 60 * 60 * 24))
+}
+
+// Build default dates map for all template steps based on a production date (Date or ISO string)
+function buildDefaultDatesMap(produceDateInput) {
+  if (!produceDateInput) return {}
+  const D0 = new Date(produceDateInput)
+  const today = new Date(); today.setHours(0,0,0,0)
+
+  // Minimum pre window assumption
+  const MIN_PRE_WINDOW = 7
+  const totalLead = Math.max(0, diffDays(D0, today)) // days from today to D0
+  const extra = Math.max(0, totalLead - MIN_PRE_WINDOW)
+  const giveIdea = Math.ceil(extra / 2)
+  const giveScript = Math.floor(extra / 2)
+
+  const dates = {}
+
+  // Pre-production (earlier is smaller ymd)
+  dates['content_strategy']  = ymd(addDays(D0, -1))
+  dates['script_approval']   = ymd(addDays(D0, -3 - giveScript))
+  dates['idea_drafting']     = ymd(addDays(D0, -5 - giveIdea))
+
+  // Production day
+  dates['production_recording'] = ymd(addDays(D0, 0))
+
+  // Wrap-up & post
+  dates['production_complete']  = ymd(addDays(D0, 1))
+  dates['post_editing']         = ymd(addDays(D0, 2))
+  dates['post_final']           = ymd(addDays(D0, 3))
+  dates['publish']              = ymd(addDays(D0, 4))
+
+  return dates
 }
 
 export default function NewSegmentModal({ onClose, onCreated }) {
@@ -100,55 +135,16 @@ export default function NewSegmentModal({ onClose, onCreated }) {
     })()
   }, [])
 
-  /**
-   * Compute default dates from the produce date.
-   * Rules:
-   *  - Production Recording = D0
-   *  - Production Complete (Director) = D0 + 1
-   *  - Post Editing = D0 + 2
-   *  - Post Final (Post Supervisor) = D0 + 3
-   *  - Publish (optional) = D0 + 4
-   *  - Pre-production:
-   *      Content Strategy Review = D0 - 1
-   *      Script Approval (gate) = D0 - 3 (min 2 days window before CSR)
-   *      Idea Drafting = D0 - 5 (min 2 days window before Script Approval)
-   *  - If there’s extra lead time before D0 (more than the minimum 7 days),
-   *    distribute the extra equally to Idea Drafting and Script Approval by pushing
-   *    their due dates earlier.
-   */
   useEffect(() => {
     if (!produceDate) return
-    const D0 = new Date(produceDate)
-    const today = new Date(); today.setHours(0,0,0,0)
+    const defaults = buildDefaultDatesMap(produceDate)
+    setStepDates(defaults)
 
-    // Minimum layout requires 7 days before D0 for pre-prod blocks (2 + 2 + 1 + buffer for ordering).
-    const MIN_PRE_WINDOW = 7
-    const totalLead = Math.max(0, diffDays(D0, today)) // days from today to D0
-    const extra = Math.max(0, totalLead - MIN_PRE_WINDOW)
-    const giveIdea = Math.ceil(extra / 2)
-    const giveScript = Math.floor(extra / 2)
-
-    const dates = {}
-
-    // Pre-production (earlier is smaller ymd)
-    dates['content_strategy']  = ymd(addDays(D0, -1))
-    dates['script_approval']   = ymd(addDays(D0, -3 - giveScript))
-    dates['idea_drafting']     = ymd(addDays(D0, -5 - giveIdea))
-
-    // Production day
-    dates['production_recording'] = ymd(addDays(D0, 0))
-
-    // Wrap-up & post
-    dates['production_complete']  = ymd(addDays(D0, 1))
-    dates['post_editing']         = ymd(addDays(D0, 2))
-    dates['post_final']           = ymd(addDays(D0, 3))
-    dates['publish']              = ymd(addDays(D0, 4))
-
-    setStepDates(dates)
     // Deadline warnings after setting stepDates
+    const today = new Date(); today.setHours(0,0,0,0)
     const todayStr = ymd(today)
     const bad = []
-    Object.entries(dates).forEach(([k,v]) => {
+    Object.entries(defaults).forEach(([k,v]) => {
       if (v < todayStr) {
         const label = STEP_TEMPLATE.find(st => st.key===k)?.name || k
         bad.push(`${label} is before today`)
@@ -195,11 +191,40 @@ export default function NewSegmentModal({ onClose, onCreated }) {
     if (!dr.userId && !dr.poolId) return alert('Assign a Director (person or pool).')
     if (!ps.userId && !ps.poolId) return alert('Assign a Post Supervisor (person or pool).')
 
+    // Merge defaults with any user adjustments coming from TimelinePlanner
+    const defaults = buildDefaultDatesMap(produceDate)
+    const datesMap = { ...defaults, ...stepDates }
+
+    // Steps we intend to create (respect optional publish)
+    const toInclude = STEP_TEMPLATE.filter(st => !st.optional || needsPublish)
+
+    // Validate that every included step has a due_date
+    const missing = toInclude.filter(st => !datesMap[st.key])
+    if (missing.length) {
+      const names = missing.map(m => m.name).join(', ')
+      return alert(`Missing due dates for: ${names}. Please set a Produce Date and adjust the timeline.`)
+    }
+
+    // Build payload for RPC; include canonical phase and ensure every step has a non-null due_date
+    const stepsPayload = toInclude.map(st => {
+      const tpl = TEMPLATE_BY_KEY[st.key] || st
+      return {
+        key: st.key,
+        name: st.name,
+        phase: tpl.phase,                 // <-- ensure 'pre' | 'prod' | 'post'
+        due_date: datesMap[st.key],       // <-- guaranteed by validation above
+        is_gate: !!tpl.is_gate,
+        gate_roles: tpl.is_gate ? (tpl.gate_roles || []) : []
+      }
+    })
+    console.log('NEW SEGMENT payload p_steps →', stepsPayload)
+
     setSaving(true)
-    const { error, data } = await supabase.rpc('create_segment_full', {
+    const { error, data } = await supabase.rpc('create_segment_with_steps', {
       p_title: title.trim(),
       p_description: description || '',
       p_owner: owner,
+      p_produce_date: produceDate,
 
       p_script_editor: se.userId || null,
       p_content_strategist: cs.userId || null,
@@ -219,29 +244,53 @@ export default function NewSegmentModal({ onClose, onCreated }) {
       p_producer_pool: (seatState['producer']?.poolId) || null,
 
       p_publisher_user: needsPublish ? (seatState['publisher']?.userId || null) : null,
-      p_publisher_pool: needsPublish ? (seatState['publisher']?.poolId || null) : null
+      p_publisher_pool: needsPublish ? (seatState['publisher']?.poolId || null) : null,
+
+      p_steps: stepsPayload
     })
     setSaving(false)
 
-    if (error) return alert(error.message || 'Failed to create segment')
-    if (!data) return
+    if (error) {
+      console.error('[create_segment_with_steps] error:', error)
+      alert(error.message || 'Failed to create segment')
+      return
+    }
 
-    // Build steps with aligned names/keys
-    const toInclude = STEP_TEMPLATE.filter(st => !st.optional || needsPublish)
-    const rows = toInclude.map(st => ({
-      segment_id: data.id,
-      name: st.name,
-      phase: st.key,
-      due_date: stepDates[st.key] || null,
-      is_gate: !!st.is_gate,
-      gate_roles: st.gate_roles || []
-    }))
+    // Log raw payload for debugging
+    console.log('[create_segment_with_steps] data:', data)
 
-    const { error: stepErr } = await supabase.from('steps').insert(rows)
-    if (stepErr) return alert(stepErr.message || 'Segment created, but adding steps failed.')
+    // Robustly resolve the new segment id from several possible shapes
+    const resolveId = (d) => {
+      if (d == null) return null
+      if (typeof d === 'number' || typeof d === 'string') return d
+      if (typeof d.id === 'number' || typeof d.id === 'string') return d.id
+      if (typeof d.segment_id === 'number' || typeof d.segment_id === 'string') return d.segment_id
+      if (d.segment && (typeof d.segment.id === 'number' || typeof d.segment.id === 'string')) return d.segment.id
+      if (d.data && (typeof d.data.id === 'number' || typeof d.data.id === 'string')) return d.data.id
+      if (Array.isArray(d) && d.length > 0) {
+        // handle array-of-rows case
+        const cand = d[0]
+        if (typeof cand === 'number' || typeof cand === 'string') return cand
+        if (cand && (typeof cand.id === 'number' || typeof cand.id === 'string')) return cand.id
+        if (cand && (typeof cand.segment_id === 'number' || typeof cand.segment_id === 'string')) return cand.segment_id
+      }
+      return null
+    }
 
+    const newId = resolveId(data)
+
+    if (!newId) {
+      console.error('[create_segment_with_steps] could not resolve id from data:', data)
+      alert('Segment created, but id was not returned in an expected format. Check console for details.')
+      return
+    }
+
+    // Close modal and notify parent (pass id, not the whole object)
     onClose?.()
-    onCreated?.(data)
+    onCreated?.(String(newId))
+
+    // Navigate directly as a safety net
+    window.location.href = `/segments/${String(newId)}`
   }
 
   return (
@@ -301,6 +350,7 @@ export default function NewSegmentModal({ onClose, onCreated }) {
                   value={produceDate}
                   onChange={e => setProduceDate(e.target.value)}
                 />
+                <p className="mt-1 text-xs text-gray-400">This date drives all deadlines. You can fine‑tune them in the Step Pipeline below.</p>
               </div>
 
               {/* Decision Seats */}

@@ -35,6 +35,9 @@ export default function SegmentDetail() {
   const [showAdminExtras, setShowAdminExtras] = useState(false) // collapsible admin info
   const [showAllSteps, setShowAllSteps] = useState(false)
   const [myPoolIds, setMyPoolIds] = useState([])
+  // --- Notification system ---
+  const [notifications, setNotifications] = useState([])
+  const [toast, setToast] = useState(null)
 
   const isLeader = useMemo(
     () => ['executive','associate'].includes(profile?.role),
@@ -55,6 +58,17 @@ export default function SegmentDetail() {
       }
     })()
   }, [router])
+  useEffect(() => {
+    // restore saved preference per user + segment
+    if (!me?.id || !id) return
+    const k = `tnn_showAllSteps_${me.id}_${id}`
+    const saved = localStorage.getItem(k)
+    if (saved === 'true' || saved === 'false') {
+      setShowAllSteps(saved === 'true')
+    } else if (profile && (profile.role === 'executive' || profile.role === 'associate')) {
+      setShowAllSteps(true)
+    }
+  }, [me, id, profile])
   // Load pool memberships for current user
   useEffect(() => {
     (async () => {
@@ -109,11 +123,50 @@ export default function SegmentDetail() {
     await loadProfilesForAssigned(stepsArr.map(s => s.assigned_to).filter(Boolean))
   }, [id])
 
+  // --- Notification loader ---
+  async function loadNotifications() {
+    if (!id) return
+    const { data } = await supabase
+      .from('notifications')
+      .select('*')
+      .eq('segment_id', id)
+      .order('created_at', { ascending: false })
+      .limit(20)
+    setNotifications(data || [])
+  }
+
   useEffect(() => {
     if (!id) return
     setLoading(true)
     reloadAll().finally(() => setLoading(false))
+    loadNotifications()
   }, [id, reloadAll])
+
+  // --- Supabase real-time notification subscription ---
+  useEffect(() => {
+    if (!id) return
+    const channel = supabase
+      .channel(`segment_${id}_notifications`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'notifications', filter: `segment_id=eq.${id}` },
+        payload => {
+          setNotifications(prev => [payload.new, ...prev])
+          setToast({ type: payload.new.kind, msg: `Step ${payload.new.step_id} ${payload.new.kind}` })
+          reloadAll()
+        }
+      )
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [id, reloadAll])
+
+  // --- Toast auto-clear effect ---
+  useEffect(() => {
+    if (toast) {
+      const t = setTimeout(() => setToast(null), 4000)
+      return () => clearTimeout(t)
+    }
+  }, [toast])
 
   // ---------- data helpers ----------
   async function loadAssetsForSteps(stepIds) {
@@ -299,7 +352,15 @@ export default function SegmentDetail() {
                   type="checkbox"
                   className="h-4 w-4"
                   checked={showAllSteps}
-                  onChange={e => setShowAllSteps(e.target.checked)}
+                  onChange={e => {
+                    const next = e.target.checked
+                    setShowAllSteps(next)
+                    try {
+                      if (me?.id && id) {
+                        localStorage.setItem(`tnn_showAllSteps_${me.id}_${id}`, String(next))
+                      }
+                    } catch {}
+                  }}
                 />
                 Show all steps
               </label>
@@ -310,6 +371,19 @@ export default function SegmentDetail() {
 
       {/* Body */}
       <main className="max-w-5xl mx-auto px-6 py-6 space-y-8">
+        {/* Notification system */}
+        {notifications.length > 0 && (
+          <div className="bg-[#1c2541] border border-gray-700 rounded-lg p-3 text-sm text-gray-200">
+            <h2 className="font-semibold mb-2">Recent Notifications</h2>
+            <ul className="space-y-1 max-h-40 overflow-y-auto">
+              {notifications.map(n => (
+                <li key={n.id} className="text-xs text-gray-300">
+                  {new Date(n.created_at).toLocaleString()} · Step {n.step_id} · {n.kind}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {/* Admin extras toggle (shows IDs, raw statuses, etc.) */}
         {isLeader && (
           <div>
@@ -320,7 +394,7 @@ export default function SegmentDetail() {
           </div>
         )}
 
-        // Build a filtered list of steps based on viewer role
+        {/* Build a filtered list of steps based on viewer role */}
         {(() => {
           let stepsToRender = steps
           if (!isLeader && !showAllSteps) {
@@ -347,6 +421,14 @@ export default function SegmentDetail() {
             stepsToRender = Array.from(ctx).sort((a,b)=>a-b).map(i => steps[i])
           }
           // Render steps
+          function assetOriginStepId(step, stepsList) {
+            if (!step?.is_gate) return step.id
+            const idx = stepsList.findIndex(s => s.id === step.id)
+            for (let i = idx - 1; i >= 0; i--) {
+              if (!stepsList[i].is_gate) return stepsList[i].id
+            }
+            return step.id
+          }
           return (
             <div className="space-y-8">
               {stepsToRender.map((step) => {
@@ -371,21 +453,11 @@ export default function SegmentDetail() {
               dueStr = step.due_date
             }
 
-            // If step is a gate, pull assets from the last non-gate step before it
-            let assetStepId = step.id
-            if (step.is_gate) {
-              const idx = steps.findIndex(s => s.id === step.id)
-              for (let i = idx - 1; i >= 0; i--) {
-                if (!steps[i].is_gate) {
-                  assetStepId = steps[i].id
-                  break
-                }
-              }
-            }
-
-            const primaryAsset = (assetsMap[assetStepId] || [])[0]
-            const moreAssets = (assetsMap[assetStepId] || []).slice(1)
-            const showMore = !!expandedAssets[assetStepId]
+            // Use assetOriginStepId helper for asset-related state
+            const originId = assetOriginStepId(step, steps)
+            const primaryAsset = (assetsMap[originId] || [])[0]
+            const moreAssets = (assetsMap[originId] || []).slice(1)
+            const showMore = !!expandedAssets[originId]
 
             const isApprovalsLocked = step.is_gate && st !== 'Awaiting Approvals'
             const approvalsReadOnly = ['Complete','Rejected'].includes(st)
@@ -432,10 +504,12 @@ export default function SegmentDetail() {
                           href={primaryAsset.file_url}
                           target="_blank"
                           rel="noreferrer"
-                          className="inline-block px-4 py-2 rounded-full bg-[#0b132b] hover:bg-[#232a45] text-[#6fffe9] font-semibold text-sm shadow transition"
+                          className="inline-block max-w-[70%] px-4 py-2 rounded-full bg-[#0b132b] hover:bg-[#232a45] text-[#6fffe9] font-semibold text-sm shadow transition"
+                          title={primaryAsset.file_url}
                         >
-                          {primaryAsset.description ||
-                            primaryAsset.file_url.replace(/^https?:\/\//, '')}
+                          <span className="truncate block">
+                            {primaryAsset.description || primaryAsset.file_url.replace(/^https?:\/\//, '')}
+                          </span>
                         </a>
                         <span className="text-xs text-gray-500">
                           {new Date(primaryAsset.uploaded_at).toLocaleString()}
@@ -455,7 +529,9 @@ export default function SegmentDetail() {
                         )}
                       </div>
                     ) : (
-                      <div className="text-sm text-gray-300">No links yet.</div>
+                      <div className="text-sm text-gray-300">
+                        {step.is_gate ? 'Waiting for a link from the previous step.' : 'No primary link yet.'}
+                      </div>
                     )}
                     {/* Asset upload: Only for non-gate steps, and only if step is not Complete */}
                     {(isLeader || me?.id === step.assigned_to) && !step.is_gate && derivedStatus(step) !== 'Complete' && (
@@ -472,7 +548,7 @@ export default function SegmentDetail() {
                     {(moreAssets.length > 0) && (
                       <div className="mt-2">
                         <button
-                          onClick={() => setExpandedAssets(prev => ({ ...prev, [step.id]: !prev[step.id] }))}
+                          onClick={() => setExpandedAssets(prev => ({ ...prev, [originId]: !prev[originId] }))}
                           className="text-xs text-gray-300 underline"
                         >
                           {showMore ? 'Hide other links/files' : `Show ${moreAssets.length} more`}
@@ -608,6 +684,12 @@ export default function SegmentDetail() {
       {saving && (
         <div className="fixed bottom-4 right-4 bg-gray-900 text-white text-sm px-3 py-2 rounded shadow">
           Saving…
+        </div>
+      )}
+      {/* Floating toast notification */}
+      {toast && (
+        <div className="fixed bottom-6 right-6 bg-[#222b4a] text-white px-4 py-2 rounded shadow-lg">
+          {toast.msg}
         </div>
       )}
     </div>
